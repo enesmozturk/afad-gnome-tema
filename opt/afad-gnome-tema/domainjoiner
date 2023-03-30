@@ -1,0 +1,388 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+#######################################
+## AcikLAB - 2019
+## v0.70
+#######################################
+# DNS kaydı ekli olmalı : 10.10.32.207
+# python req_domainjoiner.py win19ali.lab pardusmak20 domainadmin ou=Computers domainparola 
+# python req_domainjoiner.py -d win19ali.lab -m pardusmak20 -u domainadmin -l ou=Computers -p domainparola 
+
+import sys, os, subprocess
+import getpass
+import getopt
+import argparse
+
+# Parameters
+parser = argparse.ArgumentParser(description='Winrm Module')
+parser.add_argument('--domain', '-d',action="store",metavar='"DomainName"', help='Hostname or IP address of AD',required=True)
+parser.add_argument('--machine', '-m',action="store",metavar='"NewMachineName"', help='New hostname of mavhine',required=True)
+parser.add_argument('--username', '-u',action="store",metavar='"username"', help='Name od Domain User',required=True)
+parser.add_argument('--organizationalunit', '-ou',action="store",metavar='"ou=Computers"', help='Organizational Unit to add machine')
+parser.add_argument('--password', '-p',action="store",metavar='"password"', help='Password of Domain User')
+parser.add_argument('--leave', '-l',action="store",metavar='"leave"', help='Leave Domain')
+
+args = parser.parse_args()
+
+
+PATH_SAMBA = "/etc/samba/smb.conf"
+PATH_SSSD = "/etc/sssd/sssd.conf"
+PATH_PAMD_SESSIONS = "/etc/pam.d/common-session"
+PATH_HOSTS = "/etc/hosts"
+PATH_LIGHTDM = "/etc/lightdm/lightdm.conf"
+PATH_KERBEROS = "/etc/krb5.conf"
+PATH_REALM = "/etc/realmd.conf"
+PATH_NSSWITCH = "/etc/nsswitch.conf"
+PATH_SUDOADM = "/etc/sudoers.d/domainadmins"
+PATH_IFUP = "/etc/network/if-up.d/dns-update"
+
+
+def localeGen():
+    with open("/etc/locale.gen", 'r+') as f:
+        content = f.read()
+        f.seek(0)
+        f.truncate()
+        f.write(content.replace("# en_US.UTF-8 UTF-8", "en_US.UTF-8 UTF-8"))
+
+    with open("/etc/default/locale", "w") as localefile:
+        localefile.write("""LANG=tr_TR.UTF-8
+LANGUAGE=
+LC_CTYPE="en_US.UTF-8"
+LC_NUMERIC="tr_TR.UTF-8"
+LC_TIME="tr_TR.UTF-8"
+LC_COLLATE="tr_TR.UTF-8"
+LC_MONETARY="en_US.UTF-8"
+LC_MESSAGES="tr_TR.UTF-8"
+LC_PAPER="en_US.UTF-8"
+LC_NAME="tr_TR.UTF-8"
+LC_ADDRESS="tr_TR.UTF-8"
+LC_TELEPHONE="en_US.UTF-8"
+LC_MEASUREMENT="en_US.UTF-8"
+LC_IDENTIFICATION="en_US.UTF-8"
+LC_ALL=""")
+        cmd = subprocess.Popen("locale-gen", shell=True)
+        cmd.communicate()
+        cmd = subprocess.Popen("localedef -i en_US -f UTF-8 en_US-UTF-8", shell=True)
+        cmd.communicate()
+        cmd = subprocess.Popen("export LANGUAGE=en_US.UTF-8 && export LANG=en_US.UTF-8", shell=True)
+        cmd.communicate()
+        cmd = subprocess.Popen("export LC_ALL=en_US.UTF-8", shell=True)
+        cmd.communicate()
+        cmd = subprocess.Popen("localectl set-locale LC_ADDRESS=en_US.UTF-8 && localectl set-locale LC_NAME=en_US.UTF-8 && localectl set-locale LC_MESSAGES=en_US.UTF-8 && localectl set-locale LC_COLLATE=en_US.UTF-8 && localectl set-locale LC_NUMERIC=en_US.UTF-8", shell=True)
+        cmd.communicate()
+        cmd = subprocess.Popen("localectl set-locale LANG=en_US.UTF-8", shell=True)
+        cmd.communicate()
+
+def controlLocale():
+    with open("/etc/default/locale", "w") as localefile:
+        localefile.write("""LANG=tr_TR.UTF-8
+LANGUAGE=
+LC_CTYPE="en_US.UTF-8"
+LC_NUMERIC="tr_TR.UTF-8"
+LC_TIME="tr_TR.UTF-8"
+LC_COLLATE="tr_TR.UTF-8"
+LC_MONETARY="en_US.UTF-8"
+LC_MESSAGES="tr_TR.UTF-8"
+LC_PAPER="en_US.UTF-8"
+LC_NAME="tr_TR.UTF-8"
+LC_ADDRESS="tr_TR.UTF-8"
+LC_TELEPHONE="en_US.UTF-8"
+LC_MEASUREMENT="en_US.UTF-8"
+LC_IDENTIFICATION="en_US.UTF-8"
+LC_ALL=""")
+
+
+def checkWorkgroup():
+    command="net ads workgroup"
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
+    (out, err) = proc.communicate()
+    ilk,workgroupname = out.split(": ")
+    return(workgroupname)
+
+def domainInfo(domainname):
+    command="samba-tool domain info "+domainname
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
+    (out, err) = proc.communicate()
+
+    domain="None"
+    netbiosdomain="None"
+    dcname="None"
+    for line in out.decode("utf-8").splitlines():
+        if "DC name" in line:
+            ilk,dcname = line.split(": ")
+        if "Netbios domain" in line:
+            ilk,netbiosdomain = line.split(": ")
+        if "Domain" in line:
+            ilk,domain = line.split(": ")
+    return(domain,netbiosdomain,dcname)
+
+def addDomainExt(newhostname, realm):
+    command="hostname"
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
+    (oldhostname, err) = proc.communicate()
+
+    command="hostnamectl set-hostname "+newhostname+"."+realm
+    subprocess.check_output(command, shell=True)
+
+    oldhostname=oldhostname.decode("utf-8").strip()
+
+    if (subprocess.call('grep -w "127.0.1.1" %s' % (PATH_HOSTS),shell=True) == 1):
+        subprocess.Popen("echo '127.0.1.1   %s.%s   %s' >> %s" % (newhostname,realm,newhostname,PATH_HOSTS),shell=True)
+    else:
+        subprocess.Popen('sed -i "s/%s.*/%s.%s  %s/g" %s' % (oldhostname,newhostname,realm,newhostname,PATH_HOSTS),shell=True)
+
+def addSAMBA(workgroup,realm):
+    with open(PATH_SAMBA, "w") as sambafile:
+        sambafile.write("""
+    [paylas]
+   comment = Dosya paylasimi
+   path = /home/paylas/
+   browseable = yes
+   guest ok = yes
+   read only = no
+   public = yes
+   writable = yes
+
+    [global]
+    unix charset=UTF-8
+    workgroup = """ + workgroup + """
+    client signing = yes
+    client use spnego = yes
+    dedicated keytab file = /etc/krb5.keytab
+    kerberos method = secrets and keytab
+    realm = """ + realm + """
+    dns proxy = no
+    map to guest = Bad User
+    log file = /var/log/samba/log.%m
+    max log size = 1000
+    syslog = 0
+    panic action = /usr/share/samba/panic-action %d """)
+
+def addREALM(realm):
+	proc = subprocess.Popen("lsb_release -r | cut -d':' -f2 | xargs", stdout=subprocess.PIPE, shell=True)
+	(version, err) = proc.communicate()
+	proc = subprocess.Popen("lsb_release -i | cut -d':' -f2 | xargs", stdout=subprocess.PIPE, shell=True)
+	(distname, err) = proc.communicate()
+	if (distname=="Pardus" and "17" in version):
+		with open(PATH_SAMBA, "a") as sambafile:
+			sambafile.write("""client min protocol = SMB2
+client max protocol = SMB3""")
+	with open(PATH_REALM, "w") as realmfile:
+		realmfile.write("""[users]
+	default-home = /home/%D/%U
+	default-shell = /bin/bash
+	[active-directory]
+	default-client = sssd
+	os-name = """ + distname + """
+	os-version = """ + version + """
+	[service]
+	automatic-install = no
+	[""" + realm + """]
+	fully-qualified-names = no
+	automatic-id-mapping = yes
+	user-principal = yes
+	manage-system = no""")
+    
+
+
+def addSSSD(realm):
+    with open(PATH_SSSD, "w") as sssdfile:
+        sssdfile.write("""[sssd]
+services = nss, pam
+config_file_version = 2
+domains = """ + realm + """
+
+[domain/""" + realm.upper() + """]
+id_provider = ad
+override_homedir = /home/%d/%u""")
+    command1="chown root:root "+ PATH_SSSD
+    command2="chmod 600 "+ PATH_SSSD
+    subprocess.Popen(command1, stdout=subprocess.PIPE, shell=True)
+    subprocess.Popen(command2, stdout=subprocess.PIPE, shell=True)
+
+def addSSSD2():
+    with open(PATH_SSSD, "a") as sssdfile:
+        command="rm -f /var/lib/sss/db/*"
+        subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
+        sssdfile.write("""ad_gpo_access_control = permissive
+ldap_idmap_range_min =  100000000
+ldap_idmap_range_max =  170000000
+ldap_idmap_range_size =  70000000
+entry_cache_timeout = 2592000
+cache_credentials = true
+account_cache_expiration = 3\n""")
+
+def addSSSD3():
+    with open("/etc/default/sssd", "a") as sssdfile:
+        sssdfile.write("""
+LC_ALL=tr_CY.UTF-8""")
+
+
+def addDNSUpdateOnStart():
+    with open(PATH_IFUP, "w") as ifupfile:
+        ifupfile.write("""#!/bin/bash
+net ads dns register -P""")
+    command1="chown root:root "+ PATH_IFUP
+    subprocess.Popen(command1, stdout=subprocess.PIPE, shell=True)
+
+def deleteDNSUpdateOnStart():
+    command1="rm -rf "+ PATH_IFUP
+    command2="net ads dns unregister"
+    subprocess.Popen(command1, stdout=subprocess.PIPE, shell=True)
+    subprocess.Popen(command2, stdout=subprocess.PIPE, shell=True)
+
+def setTime(ntpserver):
+    command1="ntpdate "+ntpserver
+    command2="hwclock --systohc"
+    cmd=subprocess.Popen(command1, stdout=subprocess.PIPE, shell=True)
+    cmd.communicate()
+    cmd=subprocess.Popen(command2, stdout=subprocess.PIPE, shell=True)
+    cmd.communicate()
+
+def restartService(servicename):
+    command1="systemctl restart "+servicename
+    subprocess.Popen(command1, stdout=subprocess.PIPE, shell=True)
+
+def addMkHomedir():
+    content = list()
+    with open(PATH_PAMD_SESSIONS, "r") as pam:
+        for line in pam:
+            content.append(line)
+    conf = "session required pam_mkhomedir.so skel=/etc/skel umask=0077\n"
+    if not (content[len(content)-1] == conf):
+        content.append("session required pam_mkhomedir.so skel=/etc/skel umask=0077\n")
+    with open(PATH_PAMD_SESSIONS, "w") as pam:
+        for line in content:
+            pam.write(line)
+
+def krbDefaultRealm(realmname):
+    with open(PATH_KERBEROS, 'r+') as f:
+        content = f.read()
+        f.seek(0)
+        f.truncate()
+        f.write(content.replace("default_realm = ATHENA.MIT.EDU", "default_realm = "+realmname.upper()))
+
+def addSudoers(tm_domainname):
+    with open(PATH_SUDOADM, "w") as sudofile:
+        sudofile.write("""%domain\\x20admins ALL=(ALL) ALL """)
+
+def changeLightdmConf():
+    if(os.path.isfile(PATH_LIGHTDM)):
+        with open(PATH_LIGHTDM, 'r+') as f:
+            content = f.read()
+            f.seek(0)
+            f.truncate()
+            f.write(content.replace("#greeter-show-manual-login=false", "greeter-show-manual-login=true"))
+
+        with open(PATH_LIGHTDM, 'r+') as f:
+            content = f.read()
+            f.seek(0)
+            f.truncate()
+            f.write(content.replace("#greeter-hide-users=false", "greeter-hide-users=true"))
+
+def leaveDomain():
+    command1="realm leave " 
+    proc=subprocess.Popen(command1, stdout=subprocess.PIPE, shell=True)
+    (output, err) = proc.communicate()
+    return(output)
+
+
+
+#######################################
+## ana rutin
+#######################################
+def main(args):
+# python req_domainjoiner.py -d win19ali.lab -m pardusmak20 -u domainadmin -l ou=Computers -p domainparola 
+    dj_domainname=str (args.domain)
+    dj_machinename=str (args.machine)
+    dj_username=str (args.username)
+    dj_oulocation=str (args.organizationalunit)
+    dj_password=str (args.password)
+    dj_leave=str (args.leave)
+    
+    
+    if (dj_leave=="1"):
+		leaveDomain()
+    
+    if (dj_password=="None"):
+        domainpassword = getpass.getpass("Domain parolanızı giriniz: ")
+    else:
+        domainpassword = dj_password
+
+	print(dj_machinename)
+
+    if (dj_oulocation=="None"):
+        fulldn=dj_domainname.replace(".", ",dc=")
+        ouaddress="cn=Computers,dc="+fulldn
+    else:
+        fulldn=dj_domainname.replace(".", ",dc=")
+        ouaddress=dj_oulocation+",dc="+fulldn
+
+    try:
+        domainname=dj_domainname
+        cmd = subprocess.Popen("DEBIAN_FRONTEND=noninteractive apt-get update",shell=True)
+        cmd.communicate()
+
+        cmd = subprocess.Popen("DEBIAN_FRONTEND=noninteractive apt-get install krb5-user samba sssd libsss-sudo realmd packagekit adcli sssd-tools cifs-utils smbclient -y", shell=True)
+        cmd.communicate()
+
+        if (".local" in domainname.lower()):
+                with open(PATH_NSSWITCH, 'r+') as f:
+                    content = f.read()
+                    f.seek(0)
+                    f.truncate()
+                    f.write(content.replace("files mdns4_minimal [NOTFOUND=return] dns", "dns files mdns4_minimal [NOTFOUND=return]"))
+
+        if (os.path.isfile("/etc/samba/smb.conf") and os.path.isfile("/etc/krb5.conf")):
+            print("Kurulum:OK")
+        else:
+            print("Paketler yüklenmemiş.")
+            exit()
+
+        domain, netbiosdomain, dcname = domainInfo(domainname)
+        if (domain=="None"):
+            print("Ulaşılamadı, DNS adresinizi kontrol ediniz")
+            exit()
+  
+        localeGen()
+        addDomainExt(dj_machinename,domain)
+        
+
+        # domain
+        addSAMBA(netbiosdomain,domain)
+        addREALM(domain)
+
+        # setTime(dcname)
+        restartService("smbd")
+        restartService("nmbd")
+
+        command="echo "+ domainpassword +" | realm join --computer-ou=\""+ouaddress+ "\" --user=\""+dj_username+"@"+domainname.upper()+"\" "+domainname.lower()
+        cmd = subprocess.Popen(command, shell=True)
+        cmd.communicate()
+
+        command="echo "+ domainpassword +" | net ads dns register -U "+dj_username+"@"+domainname.upper()
+        cmd = subprocess.Popen(command, shell=True)
+        cmd.communicate()
+
+        krbDefaultRealm(domain)
+        addMkHomedir()
+        changeLightdmConf()
+        controlLocale()
+        addSSSD3()
+        addSudoers(domainname)
+        addDNSUpdateOnStart()
+        #print("Tebrikler")
+        addSSSD2()
+        command1="realm permit -a"        
+        cmd = subprocess.Popen(command1, shell=True)
+        cmd.communicate()
+
+        ## domaine alma
+        print("OK")
+    except IndexError as error:
+        print("eksik parametre:",error)
+
+if __name__ == "__main__":
+    main(args)
+
